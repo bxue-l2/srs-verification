@@ -2,11 +2,9 @@ package verifier
 
 import (
 	"fmt"
-	"log"
 	"math"
 	"time"
 
-	"github.com/alitto/pond"
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 )
 
@@ -30,11 +28,18 @@ func VerifySRS(config Config) {
 
 	updateSize := int64(numBatch / numUpdate)
 
-	fmt.Println("In total, will verify", numBatch, "batches")
+	fmt.Printf("In total, we will verify %v batches. Each batch contains %v points.\n", numBatch, batchSize)
+	fmt.Printf("For the first 3 batches, we show the time taken to verify each batch, then estimate the total verification hours.\n")
+	fmt.Printf("After the first 3 batches, we will update every %v batches\n", updateSize)
+
+	flag := false
+	var g1Gen bn254.G1Affine
+	var g2Gen bn254.G2Affine
+	var g2Tau bn254.G2Affine
 
 	for i := int64(0); i < int64(numBatch); i++ {
 		begin := time.Now()
-		from := i*int64(batchSize) - 1
+		from := i*int64(batchSize) - 1 // -1 for covering previous loop
 		to := (i + 1) * int64(batchSize)
 		if from < 0 {
 			from = 0
@@ -43,6 +48,7 @@ func VerifySRS(config Config) {
 			to = int64(numPoint)
 		}
 
+		// read in sections to avoid memory overflow
 		g1points, err := ReadG1PointSection(config.G1Path, uint64(from), uint64(to), 8)
 		if err != nil {
 			fmt.Println("err", err)
@@ -54,20 +60,33 @@ func VerifySRS(config Config) {
 			fmt.Println("err", err)
 			return
 		}
-		pool := pond.New(8, 0, pond.MinWorkers(8))
+
+		// get generator and initial points
+		if !flag {
+			g1Gen = g1points[0]
+			g2Gen = g2points[0]
+			g2Tau = g2points[1]
+			flag = true
+		}
+
 		verifyBegin := time.Now()
-		G1Check(g1points, g2points, pool)
-		G2Check(g1points, g2points, pool)
+		err = G1Check(g1points, g2points, &g2Gen, &g2Tau, config.NumWorker)
+		if err != nil {
+			fmt.Println("Verify SRS G1 Check error", err)
+			return
+		}
 
-		// Stop the pool and wait for all submitted tasks to complete
-		pool.StopAndWait()
+		err = G2Check(g1points, g2points, &g1Gen, &g2Gen, config.NumWorker)
+		if err != nil {
+			fmt.Println("Verify SRS G2 Check error", err)
+			return
+		}
 
-		if i == 0 {
+		if i < 3 {
 			elapsed := time.Since(begin)
 			expectedFinishDuration := uint64(elapsed.Seconds()) * numBatch
-			fmt.Printf("verify 1 batch takes %v. Verify takes %v\n", elapsed, time.Since(verifyBegin))
+			fmt.Printf("Verify 1 batch takes %v. Verify takes %v\n", elapsed, time.Since(verifyBegin))
 			fmt.Printf("verify %v batches will take %v Hours\n", numBatch, expectedFinishDuration/3600.0)
-			fmt.Printf("Showing updates every %v batches\n", updateSize)
 		} else if i%updateSize == 0 {
 			fmt.Printf("Verified %v-th batches. Time spent so far is %v\n", i, time.Since(processStart))
 		}
@@ -77,50 +96,123 @@ func VerifySRS(config Config) {
 }
 
 // https://github.com/ethereum/kzg-ceremony-specs/blob/master/docs/sequencer/sequencer.md#pairing-checks
-func G1Check(g1points []bn254.G1Affine, g2points []bn254.G2Affine, pool *pond.WorkerPool) {
+func G1Check(g1points []bn254.G1Affine, g2points []bn254.G2Affine, g2Gen *bn254.G2Affine, g2Tau *bn254.G2Affine, numWorker int) error {
 	n := uint64(len(g1points))
 	if len(g1points) != len(g2points) {
 		panic("not equal length")
 	}
 
-	for i := uint64(0); i < n-1; i++ {
-		z := i
-		pool.Submit(func() {
-			var negB1 bn254.G1Affine
-			negB1.Neg((*bn254.G1Affine)(&g1points[z]))
+	workerLoad := uint64(math.Ceil(float64(n) / float64(numWorker)))
 
-			P := [2]bn254.G1Affine{*(*bn254.G1Affine)(&g1points[z+1]), negB1}
-			Q := [2]bn254.G2Affine{*(*bn254.G2Affine)(&g2points[0]), *(*bn254.G2Affine)(&g2points[1])}
+	results := make(chan error, numWorker)
 
-			_, err := bn254.PairingCheck(P[:], Q[:])
-			if err != nil {
-				log.Fatalf("pairing failed %v\n", err)
-				panic("error")
-			}
-		})
+	for w := uint64(0); w < uint64(numWorker); w++ {
+		start := w * workerLoad
+		end := (w + 1) * workerLoad
+		if end >= n {
+			end = n - 1
+		}
+
+		go G1CheckWorker(g1points, g2points, g2Gen, g2Tau, start, end, results)
 	}
+
+	for i := 0; i < numWorker; i++ {
+		err := <-results
+		if err != nil {
+			fmt.Println("err", err)
+			return err
+		}
+	}
+
+	return nil
 }
 
 // https://github.com/ethereum/kzg-ceremony-specs/blob/master/docs/sequencer/sequencer.md#pairing-checks
-func G2Check(g1points []bn254.G1Affine, g2points []bn254.G2Affine, pool *pond.WorkerPool) {
+func G2Check(g1points []bn254.G1Affine, g2points []bn254.G2Affine, g1Gen *bn254.G1Affine, g2Gen *bn254.G2Affine, numWorker int) error {
 	n := uint64(len(g1points))
 	if len(g1points) != len(g2points) {
 		panic("not equal length")
 	}
 
-	for i := uint64(0); i < n; i++ {
-		z := i
-		pool.Submit(func() {
-			var negB1 bn254.G1Affine
-			negB1.Neg((*bn254.G1Affine)(&g1points[0]))
+	workerLoad := uint64(math.Ceil(float64(n) / float64(numWorker)))
 
-			P := [2]bn254.G1Affine{*(*bn254.G1Affine)(&g1points[z]), negB1}
-			Q := [2]bn254.G2Affine{*(*bn254.G2Affine)(&g2points[0]), *(*bn254.G2Affine)(&g2points[z])}
+	results := make(chan error, numWorker)
 
-			_, err := bn254.PairingCheck(P[:], Q[:])
-			if err != nil {
-				log.Fatalf("pairing failed %v\n", err)
-			}
-		})
+	for w := uint64(0); w < uint64(numWorker); w++ {
+		start := w * workerLoad
+		end := (w + 1) * workerLoad
+		if end > n {
+			end = n
+		}
+
+		go G2CheckWorker(g1points, g2points, g1Gen, g2Gen, start, end, results)
 	}
+
+	for i := 0; i < numWorker; i++ {
+		err := <-results
+		if err != nil {
+			fmt.Println("G2Checker err", err)
+			return err
+		}
+	}
+
+	return nil
+
+}
+
+func PairingCheck(a1 *bn254.G1Affine, a2 *bn254.G2Affine, b1 *bn254.G1Affine, b2 *bn254.G2Affine) error {
+	var negB1 bn254.G1Affine
+	negB1.Neg((*bn254.G1Affine)(b1))
+
+	P := [2]bn254.G1Affine{*(*bn254.G1Affine)(a1), negB1}
+	Q := [2]bn254.G2Affine{*(*bn254.G2Affine)(a2), *(*bn254.G2Affine)(b2)}
+
+	ok, err := bn254.PairingCheck(P[:], Q[:])
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("PairingCheck pairing not ok. SRS is invalid")
+	}
+
+	return nil
+}
+
+func G1CheckWorker(
+	g1points []bn254.G1Affine,
+	g2points []bn254.G2Affine,
+	g2Gen *bn254.G2Affine,
+	g2Tau *bn254.G2Affine,
+	start uint64, // in element, not in byte
+	end uint64,
+	results chan<- error,
+) {
+	for i := start; i < end; i++ {
+		err := PairingCheck(&g1points[i+1], g2Gen, &g1points[i], g2Tau)
+		if err != nil {
+			fmt.Println("pairing check failed at ", i)
+			results <- err
+			return
+		}
+	}
+	results <- nil
+}
+
+func G2CheckWorker(
+	g1points []bn254.G1Affine,
+	g2points []bn254.G2Affine,
+	g1Gen *bn254.G1Affine,
+	g2Gen *bn254.G2Affine,
+	start uint64, // in element, not in byte
+	end uint64,
+	results chan<- error,
+) {
+	for i := start; i < end; i++ {
+		err := PairingCheck(&g1points[i], g2Gen, g1Gen, &g2points[i])
+		if err != nil {
+			results <- err
+			return
+		}
+	}
+	results <- nil
 }
